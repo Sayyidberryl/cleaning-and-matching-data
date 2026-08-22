@@ -1,5 +1,9 @@
 import os
 import re
+import sys
+
+sys.modules['numexpr'] = None
+sys.modules['bottleneck'] = None
 
 import numpy as np
 import pandas as pd
@@ -11,7 +15,6 @@ OUTPUT_FILE = os.path.join("data", "suspend_clean_aca.xlsx")
 CEDANT_FILTER_COL   = "CEDANT SHRT NAME"
 CEDANT_FILTER_VALUE = "CENTRAL"
 
-# Regex untuk sub-removal dalam nama insured
 _INSURED_TAIL_RE = re.compile(
     r"""
     \bAS\b\s+(?:THE\s+)?(?:PRINCIPAL|OFF-TAKER|MAINTENANCE|CONTRACTOR).*
@@ -43,19 +46,18 @@ _INSURED_JUNK_WORDS = frozenset({
 })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # CLEAN FUNCTIONS
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def clean_polis(val) -> list:
-    """Hapus suffix numerik di akhir nomor polis (misal: -01, -02/03)."""
+    """Strip numeric suffixes from policy number (e.g. -01, -02/03)."""
     if pd.isna(val):
         return []
     val = str(val).strip()
     if not val:
         return []
 
-    # Strip suffix "-NNN" atau "-NNN/NNN" secara iteratif
     p = val
     while True:
         stripped = re.sub(r"-\d+(?:/\d+)?$", "", p)
@@ -67,7 +69,7 @@ def clean_polis(val) -> list:
 
 
 def clean_slip(val) -> list:
-    """Kembalikan nilai slip apa adanya (no transformation needed)."""
+    """Return slip value as-is (no transformation needed)."""
     if pd.isna(val):
         return []
     val = str(val).strip()
@@ -75,7 +77,7 @@ def clean_slip(val) -> list:
 
 
 def _remove_polis_slip_from_text(text: str, polis_ori, slip_ori) -> str:
-    """Hapus nomor polis & slip dari teks insured secara agresif."""
+    """Remove policy and slip numbers from insured name text."""
     if pd.notna(polis_ori):
         for token in [str(polis_ori).strip()] + clean_polis(polis_ori):
             if token and token != "-":
@@ -90,22 +92,20 @@ def _remove_polis_slip_from_text(text: str, polis_ori, slip_ori) -> str:
 
 
 def _normalize_insured_part(p: str) -> str:
-    """Terapkan sub-removal dan normalisasi pada satu bagian nama insured."""
+    """Apply tail removal and normalization to one insured name segment."""
     p = _INSURED_TAIL_RE.sub("", p)
     p = re.sub(r"\bKB\b",    "", p, flags=re.IGNORECASE)
     p = re.sub(r"\bA\.?W\.?\b", "", p, flags=re.IGNORECASE)
     p = re.sub(r"\(\s*\)",   "", p)
-    # Trim leading/trailing AND/OR
     p = re.sub(r"^(?:AND|OR)\b\s*", "", p, flags=re.IGNORECASE)
     p = re.sub(r"\s*\b(?:AND|OR)$", "", p, flags=re.IGNORECASE)
-    # Trim leading/trailing non-alphanumeric
     p = re.sub(r"^[^a-zA-Z0-9(]+", "", p)
     p = re.sub(r"[^a-zA-Z0-9)]+$", "", p)
     return p.strip()
 
 
 def _is_valid_insured_part(p: str) -> bool:
-    """Return True jika bagian insured layak dipertahankan."""
+    """Return True if an insured name segment is worth keeping."""
     if len(p) <= 2:
         return False
     up = p.upper()
@@ -119,7 +119,7 @@ def _is_valid_insured_part(p: str) -> bool:
 
 
 def clean_insured(val, polis_ori, slip_ori) -> list:
-    """Bersihkan nama insured dengan menghapus nomor polis/slip dan junk words."""
+    """Clean insured name by removing policy/slip numbers and junk words."""
     if pd.isna(val):
         return []
     val = str(val).strip()
@@ -128,7 +128,6 @@ def clean_insured(val, polis_ori, slip_ori) -> list:
 
     val = _remove_polis_slip_from_text(val, polis_ori, slip_ori)
 
-    # Normalisasi sebelum split
     val = re.sub(r"\(\s*[\d\.\/\-]+\s*\)", "", val)
     val = re.sub(r"\b(?:AND|AN|OR)\s*/\s*(?:AND|OR)\b", ",", val, flags=re.IGNORECASE)
     val = re.sub(r"\bAND\s+OR\b", ",", val, flags=re.IGNORECASE)
@@ -148,21 +147,12 @@ def clean_insured(val, polis_ori, slip_ori) -> list:
     return cleaned
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COLUMN EXPANSION HELPER
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# COLUMN EXPANSION
+# =============================================================================
 
-def _expand_clean_columns(
-    df: pd.DataFrame,
-    all_lists: list,
-    ori_col: str,
-    prefix: str,
-    max_cols: int,
-) -> list:
-    """
-    Tambahkan kolom clean_{prefix}_1 .. N langsung setelah kolom ori.
-    Returns daftar nama kolom baru yang ditambahkan.
-    """
+def _expand_clean_columns(df: pd.DataFrame, all_lists: list, ori_col: str, prefix: str, max_cols: int) -> list:
+    """Add clean_{prefix}_1..N columns after ori_col. Returns list of added column names."""
     added = []
     for i in range(1, max_cols + 1):
         col_name = f"clean {prefix} {i}"
@@ -171,81 +161,80 @@ def _expand_clean_columns(
     return added
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 # PROCESS DATA
-# ─────────────────────────────────────────────────────────────────────────────
+# =============================================================================
 
 def process_data(input_file: str, output_file: str) -> None:
-    print(f"[1/5] Membaca data dari: {input_file} ...")
+    print(f"[1/5] Reading: {input_file} ...")
     df = pd.read_excel(input_file, header=2)
-    print(f"      Total baris keseluruhan: {len(df):,}")
+    print(f"      Total rows: {len(df):,}")
+
+    # Remove illegal XML control characters (e.g. \x1f) that corrupt Excel workbooks
+    for c in df.select_dtypes(include=['object']).columns:
+        df[c] = df[c].astype(str).str.replace(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', regex=True)
 
     if CEDANT_FILTER_COL not in df.columns:
-        print(f"\n[ERROR] Kolom '{CEDANT_FILTER_COL}' tidak ditemukan!")
-        print(f"        Kolom tersedia: {list(df.columns)}")
+        print(f"\n[ERROR] Column '{CEDANT_FILTER_COL}' not found. Available: {list(df.columns)}")
         return
 
     df = df[df[CEDANT_FILTER_COL] == CEDANT_FILTER_VALUE].copy()
-    print(f"[2/5] Filter cedant '{CEDANT_FILTER_VALUE}': {len(df):,} baris ditemukan.")
+    print(f"[2/5] Filter '{CEDANT_FILTER_VALUE}': {len(df):,} rows.")
 
     if df.empty:
-        print("\n[WARN] Tidak ada data setelah filter. Proses dihentikan.")
+        print("\n[WARN] No data after filter. Stopping.")
         return
 
-    # Rename kolom asli → _ori
     rename_map = {"INSURED": "insured_ori", "POLIS": "polis_ori", "SLIP NO": "slip_ori"}
     df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
 
-    print("[3/5] Menjalankan proses cleaning ...")
+    print("[3/5] Cleaning ...")
 
-    all_clean_polis, all_clean_slip, all_clean_ins = [], [], []
-    max_polis = max_slip = max_ins = 1
+    # Vectorized apply — jauh lebih cepat dari iterrows() untuk dataset besar.
+    # clean_insured butuh 2 kolom (polis_ori + slip_ori) sehingga pakai apply(axis=1).
+    print(f"      Cleaning polis & slip ({len(df):,} baris) ...", flush=True)
+    all_polis = df["polis_ori"].map(clean_polis).tolist()
+    all_slip  = df["slip_ori"].map(clean_slip).tolist()
 
-    for _, row in df.iterrows():
-        p_ori = row.get("polis_ori", "")
-        s_ori = row.get("slip_ori", "")
-        i_ori = row.get("insured_ori", "")
+    print(f"      Cleaning insured ...", flush=True)
+    all_ins = df.apply(
+        lambda row: clean_insured(row.get("insured_ori", ""),
+                                  row.get("polis_ori",   ""),
+                                  row.get("slip_ori",    "")),
+        axis=1,
+    ).tolist()
 
-        c_polis = clean_polis(p_ori)
-        c_slip  = clean_slip(s_ori)
-        c_ins   = clean_insured(i_ori, p_ori, s_ori)
+    max_polis = max((len(x) for x in all_polis), default=1)
+    max_slip  = max((len(x) for x in all_slip),  default=1)
+    max_ins   = max((len(x) for x in all_ins),   default=1)
 
-        max_polis = max(max_polis, len(c_polis))
-        max_slip  = max(max_slip,  len(c_slip))
-        max_ins   = max(max_ins,   len(c_ins))
+    print("[4/5] Building output columns ...")
 
-        all_clean_polis.append(c_polis)
-        all_clean_slip.append(c_slip)
-        all_clean_ins.append(c_ins)
-
-    print("[4/5] Menyusun kolom output ...")
-
-    # Sisipkan kolom clean langsung setelah kolom _ori-nya
     new_columns = []
     for col in df.columns:
         new_columns.append(col)
         if col == "polis_ori":
-            new_columns += _expand_clean_columns(df, all_clean_polis, col, "polis",   max_polis)
+            new_columns += _expand_clean_columns(df, all_polis, col, "polis",   max_polis)
         elif col == "slip_ori":
-            new_columns += _expand_clean_columns(df, all_clean_slip,  col, "slip",    max_slip)
+            new_columns += _expand_clean_columns(df, all_slip,  col, "slip",    max_slip)
         elif col == "insured_ori":
-            new_columns += _expand_clean_columns(df, all_clean_ins,   col, "insured", max_ins)
+            new_columns += _expand_clean_columns(df, all_ins,   col, "insured", max_ins)
 
     df = df[new_columns]
 
-    print(f"[5/5] Menyimpan hasil ke: {output_file} ...")
+    print(f"[5/5] Saving to: {output_file} ...")
     df.to_excel(output_file, index=False)
 
-    print(f"\n{'=' * 55}")
-    print(f"  [OK] Selesai!")
-    print(f"  Total baris output  : {len(df):,}")
-    print(f"  Total kolom output  : {len(df.columns)}")
-    print(f"  File disimpan di    : {output_file}")
-    print(f"{'=' * 55}")
+    try:
+        from excel_styler import apply_purple_column_style
+        apply_purple_column_style(output_file, "suspend_clean")
+    except Exception as e:
+        print(f"  [WARN] Styling failed: {e}")
+
+    print(f"\n{'=' * 50}")
+    print(f"  Done. {len(df):,} rows, {len(df.columns)} cols -> {output_file}")
+    print(f"{'=' * 50}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     process_data(INPUT_FILE, OUTPUT_FILE)
