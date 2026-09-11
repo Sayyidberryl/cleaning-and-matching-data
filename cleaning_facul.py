@@ -113,6 +113,17 @@ _SLIP_NOISE_RE = re.compile(
 
 _SLIP_TOKEN_RE = re.compile(r"[A-Z0-9][A-Z0-9\-]{6,}", re.IGNORECASE)
 
+# Regex untuk mengekstrak nomor sertifikat dari polis.
+_CERT_FROM_POLIS_RE = re.compile(r'[-\s]+\s*(\d{1,6})(?:[^0-9]|$)')
+
+# Regex untuk range S/D pada sertifikat: '{1-6digit}S/D{1-6digit}'
+_CERT_SD_RE = re.compile(r'(\d{1,6})\s*S/D\s*(\d{1,6})', re.IGNORECASE)
+
+# Sertifikat valid: 1-6 digit pure numeric
+_SERTIF_DIGIT_RE = re.compile(r'^\d{1,6}$')
+
+# Max kolom sertifikat
+_MAX_SERTIF_COLS = 5
 
 # =============================================================================
 # HELPERS
@@ -120,6 +131,49 @@ _SLIP_TOKEN_RE = re.compile(r"[A-Z0-9][A-Z0-9\-]{6,}", re.IGNORECASE)
 
 def _normalize_spaces(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def extract_cert_from_polis(val) -> list:
+    """Ekstrak nomor sertifikat dari polis_ori di FACUL.
+
+    Format 1 (suffix): '{base_polis} - {1-6digit_sertif}'
+    Format 2 (S/D range): '{base_polis} - {1-6digit}S/D{1-6digit}'
+
+    Aturan:
+    - Cari suffix digit (1-6) setelah tanda '-' atau '- '
+    - Jika format S/D: breakdown range, maksimal 5 nilai
+    - Zero-pad setiap nilai ke 6 digit
+
+    Contoh:
+        '100030825120000155-001007' -> ['001007']
+        '7283738299277344 - 000211' -> ['000211']
+        '100030825120000100S/D000104' -> ['000100','000101','000102','000103','000104']
+        '100030825120000155'        -> []  (tidak ada sertif)
+    """
+    if pd.isna(val):
+        return []
+    s = str(val).strip()
+    if not s:
+        return []
+
+    # Cari pola S/D terlebih dahulu
+    m_sd = _CERT_SD_RE.search(s)
+    if m_sd:
+        start = int(m_sd.group(1))
+        end   = int(m_sd.group(2))
+        if start > end:
+            start, end = end, start
+        certs = [str(i).zfill(6) for i in range(start, end + 1)]
+        return certs[:_MAX_SERTIF_COLS]
+
+    # Cari suffix digit (1-6) setelah tanda '-'
+    m = _CERT_FROM_POLIS_RE.search(s)
+    if m:
+        raw = m.group(1)
+        if _SERTIF_DIGIT_RE.match(raw):
+            return [raw.zfill(6)]
+
+    return []
 
 
 def _is_valid_polis_token(tok: str) -> bool:
@@ -473,7 +527,7 @@ def _insert_clean_columns(df: pd.DataFrame, all_lists: list, prefix: str, max_co
     added = []
     for i in range(1, n_cols + 1):
         col_name = f"clean {prefix} {i}"
-        df[col_name] = [lst[i - 1] if i - 1 < len(lst) else None for lst in all_lists]
+        df[col_name] = [lst[i - 1] if i - 1 < len(lst) else "" for lst in all_lists]
         added.append(col_name)
     return added
 
@@ -485,11 +539,17 @@ def process_data(input_file: str, output_file: str) -> None:
 
     # Remove illegal XML control characters (e.g. \x1f) that corrupt Excel workbooks
     for c in df.select_dtypes(include=['object']).columns:
-        df[c] = df[c].astype(str).str.replace(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', regex=True)
+        df[c] = (df[c]
+                 .fillna('')
+                 .astype(str)
+                 .str.replace(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', regex=True))
 
     if CEDANT_COL not in df.columns:
         print(f"\n[ERROR] Column '{CEDANT_COL}' not found. Available: {list(df.columns)}")
         return
+
+    if "COMP_NAME.1" in df.columns and "COMP_NAME2" not in df.columns:
+        df.rename(columns={"COMP_NAME.1": "COMP_NAME2"}, inplace=True)
 
     df[CEDANT_COL] = df[CEDANT_COL].astype(str).str.strip()
     df = df[df[CEDANT_COL] == CEDANT_VALUE].copy()
@@ -523,9 +583,14 @@ def process_data(input_file: str, output_file: str) -> None:
     print(f"      Cleaning insured ...", flush=True)
     all_ins   = df["insured_ori"].map(clean_insured).tolist()
 
-    max_polis = max((len(x) for x in all_polis), default=1)
-    max_slip  = max((len(x) for x in all_slip),  default=1)
-    max_ins   = max((len(x) for x in all_ins),   default=1)
+    # Ekstrak sertifikat 6-digit dari polis_ori
+    print(f"      Extracting sertifikat dari polis ...", flush=True)
+    all_sertif = df["polis_ori"].map(extract_cert_from_polis).tolist()
+    max_sertif = max(1, max((len(x) for x in all_sertif), default=1))
+
+    max_polis = max(1, max((len(x) for x in all_polis), default=1))
+    max_slip  = max(1, max((len(x) for x in all_slip),  default=1))
+    max_ins   = max(1, max((len(x) for x in all_ins),   default=1))
 
     print(f"      -> polis cols: {max_polis}, slip cols: {max_slip}, insured cols: {max_ins}")
 
@@ -535,6 +600,8 @@ def process_data(input_file: str, output_file: str) -> None:
         new_columns.append(col)
         if col == "polis_ori":
             new_columns += _insert_clean_columns(df, all_polis, "polis")
+            # Tambahkan kolom sertifikat tepat setelah polis bersih
+            new_columns += _insert_clean_columns(df, all_sertif, "sertif", max_sertif)
         elif col == "slip_ori":
             new_columns += _insert_clean_columns(df, all_slip,  "slip")
         elif col == "insured_ori":
@@ -568,7 +635,16 @@ def process_data(input_file: str, output_file: str) -> None:
     try:
         engine = create_engine(conn_str)
         table_name = "SUSPENSE_DATA_FACUL_CLEAN"
-        df.to_sql(table_name, con=engine, if_exists="append", index=False)
+        
+        with engine.connect() as conn:
+            result = conn.execute(text(f'SELECT * FROM "{table_name}" LIMIT 0'))
+            db_cols = list(result.keys())
+            
+        export_cols = [c for c in df.columns if c in db_cols]
+        df_export = df[export_cols]
+        
+        df_export = df_export.replace({"": None})
+        df_export.to_sql(table_name, con=engine, if_exists="append", index=False)
         print(f"      -> Successfully exported {len(df):,} rows to table '{table_name}'")
     except Exception as e:
         print(f"  [WARN] PostgreSQL export failed: {e}")

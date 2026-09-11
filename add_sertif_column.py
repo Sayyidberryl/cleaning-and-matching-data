@@ -13,7 +13,17 @@ db_name = os.environ.get("DB_NAME", "postgres")
 conn_str = f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 engine = create_engine(conn_str)
 
-with engine.connect() as conn:
-    result = conn.execute(text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"))
-    for row in result:
-        print(row[0])
+queries = [
+    'ALTER TABLE "SUSPENSE_DATA_SUSPENSE_V1" ADD COLUMN IF NOT EXISTS "SERTIF_CLN" TEXT;',
+    'ALTER TABLE "SUSPENSE_DATA_SUSPENSE_V2" ADD COLUMN IF NOT EXISTS "SERTIF_CLN" TEXT;',
+]
+
+with engine.begin() as conn:
+    for q in queries:
+        try:
+            conn.execute(text(q))
+            print(f"Successfully executed: {q}")
+        except Exception as e:
+            print(f"Failed to execute {q}: {e}")
+
+print("Database altered.")

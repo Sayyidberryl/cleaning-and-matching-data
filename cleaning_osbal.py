@@ -25,6 +25,7 @@ SLIP_COL         = "FAC_SLIP"
 INSURED_COL      = "FAC_INSURED"
 CLSDT_POLIS_COL  = "CLSDT_POLICY_NO"
 CLSDT_SLIP_COL   = "CLSDT_SLIP_NO"
+CLSDT_SERTF_COL  = "CLSDT_SERTF_NO"
 
 MAX_SPLIT_COLS = 5
 
@@ -119,6 +120,60 @@ _SLIP_TOKEN_RE = re.compile(r"[A-Z0-9][A-Z0-9\-]{6,}", re.IGNORECASE)
 # HELPERS
 # =============================================================================
 
+def clean_sertif(val) -> list:
+    """Bersihkan nilai kolom sertifikat OSBAL (CLSDT_SERTF_NO)."""
+    if pd.isna(val):
+        return []
+        
+    if isinstance(val, float) and val.is_integer():
+        val = int(val)
+        
+    s = str(val).strip()
+    if s.endswith('.0'):
+        s = s[:-2]
+        
+    if not s or s == '#':
+        return []
+    # _SERTIF_DIGIT_RE = re.compile(r'^\d{1,6}$') - using regex from above
+    if re.match(r'^\d{1,6}$', s):
+        return [s.zfill(6)]
+    return []
+
+
+def extract_cert_from_polis_osbal(val) -> list:
+    """Extract certificate range S/D from OSBAL policy."""
+    if pd.isna(val): return []
+    val = str(val).strip()
+    if not val: return []
+
+    m = re.search(r"^(\d{10,})-(\d+)\s*(?:S/D|SD)\s*(\d+)$", val, re.IGNORECASE)
+    if not m:
+        m = re.search(r"^(\d{10,})\s+(\d+)\s*(?:S/D|SD)\s*(\d+)$", val, re.IGNORECASE)
+    if m:
+        start_str = m.group(2)
+        end_str = m.group(3)
+        pad_len = max(len(start_str), len(end_str), 6)
+        return [f"{start_str.zfill(pad_len)} S/D {end_str.zfill(pad_len)}"]
+
+    val_slash = val.replace('¿', '').strip()
+    if "/" in val_slash or re.search(r"\d{10,}\s+\d{1,4}(?:/|\s)", val_slash):
+        parts = [p.strip() for p in re.split(r'[\s/]+', val_slash) if p.strip()]
+        if len(parts) >= 2:
+            base = parts[0]
+            if base.isdigit() and len(base) >= 10:
+                is_valid = True
+                for seg in parts[1:]:
+                    if not seg.isdigit() or len(seg) >= len(base):
+                        is_valid = False
+                        break
+                if is_valid:
+                    start_str = parts[1]
+                    end_str = parts[-1]
+                    return [f"{start_str.zfill(6)} S/D {end_str.zfill(6)}"]
+    
+    return []
+
+
 def _normalize_spaces(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
@@ -203,7 +258,6 @@ def _expand_plus_suffix(text: str) -> list | None:
         return None
 
     base = parts[0].strip()
-    # BASE must be purely numeric and at least 10 digits long
     if not base.isdigit() or len(base) < 10:
         return None
 
@@ -211,10 +265,9 @@ def _expand_plus_suffix(text: str) -> list | None:
     for seg in parts[1:]:
         seg = seg.strip()
         if not seg.isdigit():
-            return None  # non-numeric segment → abort
+            return None
         if len(seg) >= len(base):
-            return None  # segment not shorter than base → abort
-        # Replace the last len(seg) digits of BASE with seg
+            return None
         expanded = base[: len(base) - len(seg)] + seg
         results.append(expanded)
 
@@ -249,7 +302,6 @@ def _extract_slip_tokens(text: str) -> list:
 
 
 def _clean_insured_name(name: str) -> str:
-    """Strip legal entity indicators, honorifics (Bapak, Ibu, Ny, Mr, Mrs, Ms, Sdr), titles, slashes, dashes, and quotes."""
     name = name.strip(' "\'“”«»')
     name = re.sub(r"[\/\-]", " ", name)
     name = _normalize_spaces(name)
@@ -268,35 +320,18 @@ def _clean_insured_name(name: str) -> str:
 
 
 def _cap_or_join(items: list) -> list:
-    """If item count exceeds MAX_SPLIT_COLS, join into a single comma-separated string."""
     return [",".join(items)] if len(items) > MAX_SPLIT_COLS else items
 
 
 def _clsdt_result_is_valid(tokens: list) -> bool:
-    """Return True jika hasil clean_polis/clean_slip dari CLSDT mengandung
-    setidaknya satu token yang terlihat seperti nomor nyata.
-
-    Kriteria: token harus mengandung urutan digit berturutan yang cukup panjang:
-    - >= 10 digit berturutan  ->  nomor polis ACA (18 digit)
-    - >= 7 digit berturutan   ->  nomor slip, ASAL tidak mengandung 'TBA'
-
-    Otomatis menolak:
-      - 'P3/P4 CANCEL'        -> 0 digit berturutan
-      - 'TBA', 'VARIOUS'      -> 0 digit
-      - 'REVISED DOUBLE CANCEL' -> 0 digit
-      - '219+109+...+298TBA'  -> max 3 digit berturutan, tidak lolos threshold
-      - []
-    """
     if not tokens:
         return False
     for tok in tokens:
         if not tok:
             continue
         s = str(tok)
-        # Cek urutan >= 10 digit berturutan (polis ACA, slip panjang, comma-joined)
         if re.search(r"\d{10,}", s):
             return True
-        # Cek urutan >= 7 digit berturutan untuk slip pendek (7-9 digit)
         if re.search(r"\d{7,}", s) and not re.search(r"\bTBA\b", s, re.IGNORECASE):
             return True
     return False
@@ -312,6 +347,28 @@ def clean_polis(val) -> list:
     val = str(val).strip()
     if not val:
         return []
+
+    # Handle S/D sequence like 100030323050000499-000001S/D000007
+    m = re.search(r"^(\d{10,})-(\d+)\s*(?:S/D|SD)\s*(\d+)$", val, re.IGNORECASE)
+    if not m:
+        m = re.search(r"^(\d{10,})\s+(\d+)\s*(?:S/D|SD)\s*(\d+)$", val, re.IGNORECASE)
+    if m:
+        return [m.group(1)]
+
+    # Handle suffix sequence like: 101030819040000012 80/81/83/¿
+    val_slash = val.replace('¿', '').strip()
+    if "/" in val_slash or re.search(r"\d{10,}\s+\d{1,4}(?:/|\s)", val_slash):
+        parts = [p.strip() for p in re.split(r'[\s/]+', val_slash) if p.strip()]
+        if len(parts) >= 2:
+            base = parts[0]
+            if base.isdigit() and len(base) >= 10:
+                is_valid = True
+                for seg in parts[1:]:
+                    if not seg.isdigit() or len(seg) >= len(base):
+                        is_valid = False
+                        break
+                if is_valid:
+                    return [base]
 
     if POLIS_EXCEPTION_RE.search(val):
         tokens = _extract_polis_tokens(val)
@@ -348,13 +405,11 @@ def clean_polis(val) -> list:
             return _cap_or_join(tokens)
 
     if "+" in val:
-        # --- Skenario A: ada entry terpisah (double-space gap + blok non-'+') ---
         if re.search(r"\s{2,}", val):
             blocks = re.split(r"\s{2,}", val.strip())
             plus_blocks  = [b for b in blocks if "+" in b]
             entry_blocks = [b.strip() for b in blocks if "+" not in b and b.strip()]
             if plus_blocks and entry_blocks:
-                # Blok '+' diabaikan; hanya entry terpisah yang diambil sebagai token
                 entry_tokens = []
                 for eb in entry_blocks:
                     for tok in eb.split():
@@ -366,12 +421,10 @@ def clean_polis(val) -> list:
                 if entry_tokens:
                     return _cap_or_join(entry_tokens)
 
-        # --- Skenario B: satu blok '+' tanpa entry terpisah → expand suffix-replace ---
         expanded = _expand_plus_suffix(val.strip())
         if expanded:
             return _cap_or_join(expanded)
 
-        # --- Fallback: logic lama ---
         tokens = _extract_polis_tokens(val)
         if tokens:
             return _cap_or_join(tokens)
@@ -415,7 +468,6 @@ def clean_slip(val) -> list:
     if not val:
         return []
 
-    # --- Skenario A: ada entry terpisah (double-space gap + blok non-'+') ---
     if "+" in val and re.search(r"\s{2,}", val):
         blocks = re.split(r"\s{2,}", val.strip())
         plus_blocks  = [b for b in blocks if "+" in b]
@@ -500,7 +552,6 @@ def process_data(input_file: str, output_file: str) -> None:
     df = pd.read_excel(input_file, header=0)
     print(f"      Total rows: {len(df):,}", flush=True)
 
-    # Remove illegal XML control characters (e.g. \x1f) that corrupt Excel workbooks
     for c in df.select_dtypes(include=['object']).columns:
         df[c] = df[c].astype(str).str.replace(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', regex=True)
 
@@ -521,9 +572,9 @@ def process_data(input_file: str, output_file: str) -> None:
             print(f"\n[ERROR] Column '{col}' not found. Available: {list(df.columns)}")
             return
 
-    # Kolom CLSDT bersifat opsional — tidak error jika tidak ada
     has_clsdt_polis = CLSDT_POLIS_COL in df.columns
     has_clsdt_slip  = CLSDT_SLIP_COL  in df.columns
+    has_clsdt_sertf = CLSDT_SERTF_COL  in df.columns
     if not has_clsdt_polis:
         print(f"  [INFO] Column '{CLSDT_POLIS_COL}' not found, will use FAC polis only.")
     if not has_clsdt_slip:
@@ -533,23 +584,6 @@ def process_data(input_file: str, output_file: str) -> None:
 
     print("[3/5] Cleaning ...")
 
-    # -----------------------------------------------------------------------
-    # Logika prioritas untuk clean polis & clean slip:
-    #   1. Jika CLSDT ada dan hasil clean-nya valid (bukan hanya teks exception)
-    #      → gunakan hasil clean CLSDT
-    #   2. Jika CLSDT kosong ATAU hasilnya hanya teks exception (P3 CANCEL, TBA, dst)
-    #      → fallback ke FAC (polis_ori / slip_ori)
-    # Kolom CLSDT asli TIDAK diubah.
-    # -----------------------------------------------------------------------
-
-    # -----------------------------------------------------------------------
-    # Vectorized cleaning — jauh lebih cepat dari iterrows() untuk 481k baris.
-    # Strategi CLSDT:
-    #   1. map() clean_polis/slip ke kolom CLSDT (jika ada) → all_clsdt_*
-    #   2. map() clean_polis/slip ke kolom FAC (polis_ori/slip_ori) → all_fac_*
-    #   3. List comprehension: pilih CLSDT jika valid, else fallback ke FAC
-    # Ini 5-10x lebih cepat dari iterrows() sambil mempertahankan logika yang sama.
-    # -----------------------------------------------------------------------
     clsdt_polis_col = CLSDT_POLIS_COL if has_clsdt_polis else None
     clsdt_slip_col  = CLSDT_SLIP_COL  if has_clsdt_slip  else None
 
@@ -564,6 +598,18 @@ def process_data(input_file: str, output_file: str) -> None:
         ]
     else:
         all_polis = df["polis_ori"].map(clean_polis).tolist()
+
+    # --- SERTIFIKAT ---
+    print(f"      Cleaning sertifikat ...", flush=True)
+    _polis_sertif = df["polis_ori"].map(extract_cert_from_polis_osbal).tolist()
+    if has_clsdt_sertf:
+        _clsdt_sertif = df[CLSDT_SERTF_COL].map(clean_sertif).tolist()
+        all_sertif = [
+            ps if ps else cs 
+            for ps, cs in zip(_polis_sertif, _clsdt_sertif)
+        ]
+    else:
+        all_sertif = _polis_sertif
 
     # --- SLIP ---
     print(f"      Cleaning slip ...", flush=True)
@@ -582,10 +628,11 @@ def process_data(input_file: str, output_file: str) -> None:
     all_ins = df["insured_ori"].map(clean_insured).tolist()
 
     max_polis = max((len(x) for x in all_polis), default=1)
+    max_sertif = max((len(x) for x in all_sertif), default=1)
     max_slip  = max((len(x) for x in all_slip),  default=1)
     max_ins   = max((len(x) for x in all_ins),   default=1)
 
-    print(f"      -> polis cols: {max_polis}, slip cols: {max_slip}, insured cols: {max_ins}")
+    print(f"      -> polis cols: {max_polis}, sertif cols: {max_sertif}, slip cols: {max_slip}, insured cols: {max_ins}")
 
     print("[4/5] Building output columns ...")
     new_columns = []
@@ -593,6 +640,7 @@ def process_data(input_file: str, output_file: str) -> None:
         new_columns.append(col)
         if col == "polis_ori":
             new_columns += _insert_clean_columns(df, all_polis, "polis",   max_polis)
+            new_columns += _insert_clean_columns(df, all_sertif, "sertif", max_sertif)
         elif col == "slip_ori":
             new_columns += _insert_clean_columns(df, all_slip,  "slip",    max_slip)
         elif col == "insured_ori":

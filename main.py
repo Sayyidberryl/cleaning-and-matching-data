@@ -23,19 +23,20 @@ OSBAL_FILE   = os.path.join("data", "osbal_clean_aca.xlsx")
 FACUL_FILE   = os.path.join("data", "facul_clean_aca.xlsx")
 
 PIPELINE_PHASES = [
-    # {
-    #     "phase_name": "Phase 1: Data Cleaning",
-    #     "steps": [
-    #         {"num": 1, "name": "Cleaning Facul Data", "script": "cleaning_facul.py", "output": FACUL_FILE},
-    #         {"num": 2, "name": "Cleaning OSBAL Data", "script": "cleaning_osbal.py", "output": OSBAL_FILE},
-    #         {"num": 3, "name": "Cleaning Suspend Data", "script": "cleaning_suspend.py", "output": SUSPEND_FILE},
-    #     ]
-    # },
     {
-        "phase_name": "Phase 2: Suspend Matching & Export Database",
+        "phase_name": "Phase 1: Data Cleaning",
+        "steps": [
+            {"num": 1, "name": "Cleaning Facul Data", "script": "cleaning_facul.py", "output": FACUL_FILE},
+            {"num": 2, "name": "Cleaning OSBAL Data", "script": "cleaning_osbal.py", "output": OSBAL_FILE},
+            {"num": 3, "name": "Cleaning Suspend Data", "script": "cleaning_suspend.py", "output": SUSPEND_FILE},
+        ]
+    },
+    {
+        "phase_name": "Phase 2: Suspend Matching (v1, v2, & Alter Engine)",
         "steps": [
             {"num": 4, "name": "Suspend Matching v1", "script": "prod_sus_1.py", "output": os.path.join("data", "final_output_v1.xlsx")},
             {"num": 5, "name": "Suspend Matching v2", "script": "prod_sus_2.py", "output": os.path.join("data", "final_output_v2.xlsx")},
+            {"num": 6, "name": "Alter Matching Engine", "script": "alter.py", "output": os.path.join("data", "final_output.xlsx")},
         ]
     }
 ]
@@ -115,6 +116,24 @@ def run_pipeline():
     print(f"Total Waktu Eksekusi: {t_total:.1f} detik ({t_total/60:.1f} menit)", flush=True)
     print("Semua output (Excel & DB PostgreSQL) berhasil diperbarui!", flush=True)
     print("=" * 80, flush=True)
+
+    # Menampilkan summary dari alter.py
+    alter_log = os.path.join("data", "alter.py.log")
+    if os.path.exists(alter_log):
+        with open(alter_log, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+            start_idx = -1
+            for i in range(len(lines)-1, -1, -1):
+                if "Done in " in lines[i]:
+                    start_idx = i - 1  # include the separator line above it
+                    break
+            
+            if start_idx != -1:
+                print("\n\n" + "=" * 60)
+                print("  RINGKASAN HASIL ALTER MATCHING ENGINE")
+                print("=" * 60)
+                for line in lines[start_idx:]:
+                    print(line, end="")
 
 if __name__ == "__main__":
     run_pipeline()
